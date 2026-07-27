@@ -858,6 +858,8 @@
                             onclick="openEngravingModal('text')">テキスト追加</button>
                         <button class="btn-secondary" style="flex:1;font-size:11px;"
                             onclick="openEngravingModal('draw')">手書き追加</button>
+                        <button class="btn-secondary" id="paste-eng-btn" style="flex:1;font-size:11px;display:none;"
+                            onclick="pasteEng()">📋貼り付け</button>
                     </div>
                     <div id="eng-list-container" class="eng-list" style="margin-top:6px;"></div>
                     <div style="font-size:11px;color:#888;margin-bottom:6px;margin-top:10px;">── 穴・形状 ──</div>
@@ -1085,7 +1087,14 @@
                 x2: pData.x2, y2: pData.y2, angle2: pData.angle2, in2D: pData.in2D || false,
                 color2D: pData.color2D || '#dbeafe', flipped2D: (pData.shapeType === 'merged-part') ? false : (pData.flipped2D || false),
                 frontSign: pData.frontSign || 1, joints,
-                engravings: pData.engravings || [], shapes: pData.shapes || [],
+                engravings: pData.engravings || [], shapes: (pData.shapes || []).map(s => {
+                    // applyMirror と flipped2D の不一致を自動補正（旧データ・複製バグ対策）
+                    const _flip = (pData.shapeType === 'merged-part') ? !!pData.mergedFlipX : !!pData.flipped2D;
+                    const _am = !!s.applyMirror;
+                    if (_am !== _flip) { s = { ...s, x: (pData.w || 0) - s.x, applyMirror: false }; }
+                    else { s = { ...s, applyMirror: false }; }
+                    return s;
+                }),
                 mergedD: pData.mergedD || null, mergedDBase: pData.mergedDBase || null, mergedD3D: pData.mergedD3D || null,
                 w3D: pData.w3D || null, h3D: pData.h3D || null,
                 originalParts: pData.originalParts || null,
@@ -1104,6 +1113,8 @@
             part.mesh.position.set(pData.px, pData.py, pData.pz);
             part.mesh.rotation.set(pData.rx, pData.ry, pData.rz);
             scene.add(part.mesh);
+            // rotation.set()後にquaternion・matrixWorldを強制更新してからテクスチャを生成
+            part.mesh.updateMatrixWorld(true);
             if ((part.engravings || []).length > 0) update3DEngravings(part);
             if ((part.shapes || []).length > 0) update3DShapes(part);
             return part;
@@ -1112,7 +1123,11 @@
         function getSnapshot() {
             return JSON.stringify({
                 board: board, fit: fitClearance, tighten: jointTighten,
-                parts: partsData.map(p => _serializePart(p))
+                parts: partsData.map(p => _serializePart(p)),
+                camera: (camera && controls) ? {
+                    position: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+                    target: { x: controls.target.x, y: controls.target.y, z: controls.target.z }
+                } : undefined
             });
         }
 
@@ -1140,8 +1155,21 @@
                 partsData.push(_buildPartFromData(pData));
             });
 
+            if (data.camera && camera && controls) {
+                if (data.camera.position) camera.position.set(data.camera.position.x, data.camera.position.y, data.camera.position.z);
+                if (data.camera.target) controls.target.set(data.camera.target.x, data.camera.target.y, data.camera.target.z);
+                controls.update();
+            }
+
             if (document.getElementById('panel-2d').classList.contains('active')) { render2D(); }
             checkOverlaps();
+            // カメラquaternionが確定した後（2フレーム後）に刻印・図形テクスチャを再生成
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+                partsData.forEach(p => {
+                    if ((p.engravings || []).length > 0) update3DEngravings(p);
+                    if ((p.shapes || []).length > 0) update3DShapes(p);
+                });
+            }));
         }
 
         function undo() {
@@ -1170,6 +1198,7 @@
         let scene, camera, renderer, controls;
         let board = { w: 350, h: 265, margin: 5 }; let canvas, partsLayer;
         let dragEng3D = null; let selectedEng3DId = null;
+        let _engClipboard = null; // コピーしたイラスト（一時保持）
         let dragShp3D = null; // 3Dビューで図形・穴をドラッグ
         let dragPart3D = null; // タッチ/ポインタで3D木材をドラッグ移動
         let fitClearance = 0.1;
@@ -2046,11 +2075,9 @@
                 }
                 return p.mergedDBase || p.mergedD || `M 0,0 L ${w},0 L ${w},${h} L 0,${h} Z`;
             }
-            const flipped = p.flipped2D;
             if (!shapeType || shapeType === 'rect' || shapeType === 'kerf') {
                 const { outerPts: rawOuter } = buildBoardOutline(w, h, jointsMap(p));
-                const pts = flipped ? rawOuter.map(pt => ({ x: w - pt.x, y: pt.y })) : rawOuter;
-                const svgPts = pts.map(pt => ({ x: pt.x, y: h - pt.y }));
+                const svgPts = rawOuter.map(pt => ({ x: pt.x, y: h - pt.y }));
                 return 'M' + svgPts.map(pt => `${pt.x},${pt.y}`).join(' L') + ' Z';
             }
             if (shapeType === 'arch') {
@@ -2613,17 +2640,6 @@
             const _flip3D = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
             const engSide = _flip3D ? -1 : 1;
 
-            // カメラ視点からテクスチャがX反転して見えるか判定する
-            let applyMirror = false;
-            if (part.mesh && camera) {
-                part.mesh.updateMatrixWorld();
-                const planeXWorld = new THREE.Vector3(engSide, 0, 0).applyQuaternion(part.mesh.quaternion);
-                const cameraRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
-                applyMirror = planeXWorld.dot(cameraRight) < 0;
-            }
-            // 結合部材はmergedFlipXがtrueのとき2DでX反転されるため、3D側でも同様に反転を追加する
-            if (part.shapeType === 'merged-part' && !!part.mergedFlipX) applyMirror = !applyMirror;
-
             const res = 4; // px/mm
             const cw = Math.max(1, Math.round(part.w * res));
             const ch = Math.max(1, Math.round(part.h * res));
@@ -2632,15 +2648,20 @@
             const ctx = off.getContext('2d');
             ctx.clearRect(0, 0, cw, ch);
 
-            // カメラからX反転して見える場合、キャンバスを水平ミラーして事前に打ち消す
-            if (applyMirror) {
-                ctx.save();
-                ctx.translate(cw, 0);
-                ctx.scale(-1, 1);
-            }
-
             shapes.forEach(s => {
+                // 旧データ互換: applyMirrorが未保存の場合はカメラから算出して保存
+                if (s.applyMirror === undefined) {
+                    if (_flip3D) {
+                        s.applyMirror = false;
+                    } else if (part.mesh && camera) {
+                        part.mesh.updateMatrixWorld(true);
+                        const _planeX = new THREE.Vector3(1, 0, 0).applyQuaternion(part.mesh.quaternion);
+                        const _camR = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+                        s.applyMirror = _planeX.dot(_camR) < 0;
+                    } else { s.applyMirror = false; }
+                }
                 ctx.save();
+                if (s.applyMirror) { ctx.translate(cw, 0); ctx.scale(-1, 1); }
                 const isCut = s.mode === 'cut';
                 ctx.strokeStyle = isCut ? '#ff3300' : '#0055ff';
                 ctx.fillStyle   = isCut ? 'rgba(255,80,0,0.18)' : 'rgba(0,85,255,0.13)';
@@ -2688,10 +2709,6 @@
                 }
                 ctx.restore();
             });
-
-            if (applyMirror) {
-                ctx.restore();
-            }
 
             const texture = new THREE.CanvasTexture(off);
             texture.needsUpdate = true;
@@ -3243,8 +3260,6 @@ function checkOverlaps() {
                             const _meshXW = new THREE.Vector3(1, 0, 0).applyQuaternion(part.mesh.quaternion);
                             const _camR = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
                             let _xFlipped = _meshXW.dot(_camR) < 0;
-                            // 結合部材でmergedFlipXがtrueのとき、2D座標系もX反転されているため補正
-                            if (part.shapeType === 'merged-part' && !!part.mergedFlipX) _xFlipped = !_xFlipped;
                             const newX = Math.max(0, Math.min(part.w, _xFlipped ? (part.w / 2 - lp.x) : (lp.x + part.w / 2)));
                             const newY = Math.max(0, Math.min(part.h, part.h / 2 - lp.y));
                             if (dragShp3D.isPeg) {
@@ -3280,8 +3295,6 @@ function checkOverlaps() {
                                 const _meshXW = new THREE.Vector3(1, 0, 0).applyQuaternion(part.mesh.quaternion);
                                 const _camR = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
                                 let _xFlipped = _meshXW.dot(_camR) < 0;
-                                // 結合部材でmergedFlipXがtrueのとき、2D座標系もX反転されているため補正
-                                if (part.shapeType === 'merged-part' && !!part.mergedFlipX) _xFlipped = !_xFlipped;
                                 eng.x = Math.max(0, Math.min(part.w, _xFlipped ? (part.w / 2 - lp.x) : (lp.x + part.w / 2)));
                                 eng.y = Math.max(0, Math.min(part.h, lp.y + part.h / 2));
                                 update3DEngravings(part); render2D();
@@ -3318,8 +3331,6 @@ function checkOverlaps() {
                                 const _meshXW = new THREE.Vector3(1, 0, 0).applyQuaternion(sp.part.mesh.quaternion);
                                 const _camR = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
                                 let _xFlipped = _meshXW.dot(_camR) < 0;
-                                // 結合部材でmergedFlipXがtrueのとき、2D座標系もX反転されているため補正
-                                if (sp.part.shapeType === 'merged-part' && !!sp.part.mergedFlipX) _xFlipped = !_xFlipped;
                                 const hitX = _xFlipped ? (sp.part.w / 2 - localPt.x) : (localPt.x + sp.part.w / 2);
                                 const hitY = sp.part.h / 2 - localPt.y;
                                 // 最近傍の図形を探す
@@ -3355,8 +3366,6 @@ function checkOverlaps() {
                                 const _meshXW = new THREE.Vector3(1, 0, 0).applyQuaternion(ep.part.mesh.quaternion);
                                 const _camR = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
                                 let _xFlipped = _meshXW.dot(_camR) < 0;
-                                // 結合部材でmergedFlipXがtrueのとき、2D座標系もX反転されているため補正
-                                if (ep.part.shapeType === 'merged-part' && !!ep.part.mergedFlipX) _xFlipped = !_xFlipped;
                                 const hitX = _xFlipped ? (ep.part.w / 2 - localPt.x) : (localPt.x + ep.part.w / 2);
                                 const hitY = localPt.y + ep.part.h / 2;
                                 let bestEng = null, bestD = Infinity;
@@ -6130,9 +6139,9 @@ function confirmJoint() {
                     effectiveFlip  = !!p.mergedFlipX;
                     effectiveYFlip = !!p.mergedFlipY;
                 }
-                // 通常板: effectiveFlipで穴をX反転。結合部材: mirrorGラッパーが反転を担うので不要
-                const _needManualFlip = effectiveFlip && p.shapeType !== 'merged-part';
-                const _rh = _needManualFlip ? rawHoles.map(h => {
+                // 裏面（flipped2D=true）は2Dでその面を表として扱うためX反転
+                const shouldFlip = p.shapeType === 'merged-part' ? !!p.mergedFlipX : !!p.flipped2D;
+                const _rh = shouldFlip ? rawHoles.map(h => {
                     if (h.type === 'arcSeg') return { ...h, cx: p.w - h.cx, aStart: Math.PI - h.aEnd, aEnd: Math.PI - h.aStart };
                     if (h.isRotated) return { ...h, cx: p.w - h.cx, angle: 180 - (h.angle || 0) };
                     return { x: p.w - h.x - h.w, y: h.y, w: h.w, h: h.h };
@@ -6152,12 +6161,10 @@ function confirmJoint() {
                 const cx = p.w / 2; const cy = p.h / 2;
                 g.setAttribute('transform', `translate(${p.x2}, ${p.y2}) rotate(${p.angle2}, ${cx}, ${cy})`);
 
-                // effectiveFlip/effectiveYFlipが有効な結合部材はミラーラッパーグループを挿入
-                // これによりアウトライン・穴・図形・刻印すべてが一括ミラーされる
                 let contentG = g;
-                if ((effectiveFlip || effectiveYFlip) && p.shapeType === 'merged-part') {
+                if (shouldFlip) {
                     const _mirG = document.createElementNS(SVG_NS, 'g');
-                    _mirG.setAttribute('transform', `translate(${effectiveFlip ? p.w : 0},${effectiveYFlip ? p.h : 0}) scale(${effectiveFlip ? -1 : 1},${effectiveYFlip ? -1 : 1})`);
+                    _mirG.setAttribute('transform', `translate(${p.w},0) scale(-1,1)`);
                     g.appendChild(_mirG);
                     contentG = _mirG;
                 }
@@ -6242,7 +6249,8 @@ function confirmJoint() {
                     sg.setAttribute('data-shape-id', s.id);
                     sg.setAttribute('data-part-id', p.id);
 
-                    // ① 本体（見た目）- ミラーはcontentGのラッパーが担う
+                    // ① 本体（見た目）- shouldFlip時: _mirGがscale(-1,1)するためp.w-s.xを渡すとs.xの位置に描画される
+                    const _ssx = shouldFlip ? p.w - s.x : s.x;
                     let el;
                     if (s.type === 'merged') {
                         el = document.createElementNS(SVG_NS, 'path');
@@ -6250,19 +6258,19 @@ function confirmJoint() {
                         el.setAttribute('fill-rule', 'evenodd');
                     } else if (s.type === 'circle') {
                         el = document.createElementNS(SVG_NS, 'circle');
-                        el.setAttribute('cx', s.x); el.setAttribute('cy', s.y); el.setAttribute('r', s.r);
+                        el.setAttribute('cx', _ssx); el.setAttribute('cy', s.y); el.setAttribute('r', s.r);
                     } else if (s.type === 'ellipse') {
                         el = document.createElementNS(SVG_NS, 'ellipse');
-                        el.setAttribute('cx', s.x); el.setAttribute('cy', s.y);
+                        el.setAttribute('cx', _ssx); el.setAttribute('cy', s.y);
                         el.setAttribute('rx', (s.w || 20) / 2); el.setAttribute('ry', (s.h || 20) / 2);
                     } else if (s.type === 'rect' || s.type === 'square') {
                         el = document.createElementNS(SVG_NS, 'rect');
-                        el.setAttribute('x', s.x - (s.w || 20) / 2); el.setAttribute('y', s.y - (s.h || 20) / 2);
+                        el.setAttribute('x', _ssx - (s.w || 20) / 2); el.setAttribute('y', s.y - (s.h || 20) / 2);
                         el.setAttribute('width', s.w || 20); el.setAttribute('height', s.h || 20);
                     } else {
                         const pts = getShapePolygonPts(s);
                         el = document.createElementNS(SVG_NS, 'polygon');
-                        el.setAttribute('points', pts.map(p2 => `${s.x + p2.x},${s.y + p2.y}`).join(' '));
+                        el.setAttribute('points', pts.map(p2 => `${_ssx + p2.x},${s.y + p2.y}`).join(' '));
                     }
                     el.setAttribute('stroke', s.mode === 'cut' ? '#000' : '#0055ff');
                     el.setAttribute('stroke-width', '0.7');
@@ -6273,16 +6281,16 @@ function confirmJoint() {
                     el.setAttribute('pointer-events', 'none');
                     sg.appendChild(el);
 
-                    // ② 透明ヒット領域（ドラッグ判定用）
+                    // ② 透明ヒット領域（ドラッグ判定用）- 同様にX座標を補正
                     let hit;
                     if (s.type === 'circle') {
                         hit = document.createElementNS(SVG_NS, 'circle');
-                        hit.setAttribute('cx', s.x); hit.setAttribute('cy', s.y);
+                        hit.setAttribute('cx', _ssx); hit.setAttribute('cy', s.y);
                         hit.setAttribute('r', Math.max(s.r, 3));
                     } else {
                         const hw = Math.max(s.w || s.r*2 || 20, 6), hh = Math.max(s.h || s.r*2 || 20, 6);
                         hit = document.createElementNS(SVG_NS, 'rect');
-                        hit.setAttribute('x', s.x - hw / 2); hit.setAttribute('y', s.y - hh / 2);
+                        hit.setAttribute('x', _ssx - hw / 2); hit.setAttribute('y', s.y - hh / 2);
                         hit.setAttribute('width', hw); hit.setAttribute('height', hh);
                     }
                     hit.setAttribute('class', 'shape-hit-area');
@@ -6317,13 +6325,12 @@ function confirmJoint() {
                     eg.setAttribute('data-eng-id', eng.id);
                     eg.setAttribute('data-part-id', p.id);
 
-                    // 位置はmirrorGラッパーが担う。テキスト内容の歪みを打ち消すスケール補正を追加
-                    const ex = eng.x;
+                    // shouldFlip時: _mirGがscale(-1,1)するため、ex=p.w-eng.xを渡すと_mirG後にeng.xの位置に描画される
+                    const ex = shouldFlip ? p.w - eng.x : eng.x;
                     const ey = p.h - eng.y;
-                    const rot = eng.rotation || 0;
-                    const _esfx = (eng.flipped ? -1 : 1) * (effectiveFlip ? -1 : 1);
-                    const _esfy = effectiveYFlip ? -1 : 1;
-                    eg.setAttribute('transform', `translate(${ex},${ey}) rotate(${rot}) scale(${_esfx},${_esfy})`);
+                    const rot = (eng.rotation || 0) * (shouldFlip ? -1 : 1);
+                    const _esfx = (eng.flipped ? -1 : 1) * (shouldFlip ? -1 : 1);
+                    eg.setAttribute('transform', `translate(${ex},${ey}) rotate(${rot}) scale(${_esfx},1)`);
 
                     if (eng.type === 'text') {
                         const t = document.createElementNS(SVG_NS, 'text');
@@ -6432,13 +6439,6 @@ function confirmJoint() {
                 const hitArea = st.querySelector('.shape-hit-area');
                 if (hitArea) { hitArea.setAttribute('stroke', '#ff6600'); hitArea.setAttribute('stroke-width', '2'); hitArea.setAttribute('stroke-dasharray', '3,1'); }
 
-                // effectiveFlip/effectiveYFlip をドラッグ補正用にクロージャに保存
-                let _dragFlipX = part.flipped2D, _dragFlipY = false;
-                if (part.shapeType === 'merged-part') {
-                    _dragFlipX = !!part.mergedFlipX;
-                    _dragFlipY = !!part.mergedFlipY;
-                }
-
                 const onShpMove = (ev) => {
                     if (ev.buttons === 0) { onShpEnd(); return; } // 残留ドラッグ防止：ボタンが離れていたら終了
                     if (!dragShpId) return;
@@ -6447,9 +6447,10 @@ function confirmJoint() {
                     const dx = m.x - dragShpMouseStart.x, dy = m.y - dragShpMouseStart.y;
                     const pt = partsData.find(p => p.id === dragShpPartId);
                     if (!pt) return;
+                    const _sfDrag = pt.shapeType === 'merged-part' ? !!pt.mergedFlipX : !!pt.flipped2D;
                     const a = pt.angle2 * Math.PI / 180;
-                    const dxL = (_dragFlipX ? -1 : 1) * (dx * Math.cos(a) + dy * Math.sin(a));
-                    const dyL = (_dragFlipY ? -1 : 1) * (-dx * Math.sin(a) + dy * Math.cos(a));
+                    const dxL = (_sfDrag ? -1 : 1) * (dx * Math.cos(a) + dy * Math.sin(a));
+                    const dyL = -dx * Math.sin(a) + dy * Math.cos(a);
                     if (isPeg && pegStarts) {
                         // パンチング：全穴を一括移動（クランプなし）
                         (pt.shapes || []).filter(s => s._pegboard).forEach(s => {
@@ -6531,14 +6532,9 @@ function confirmJoint() {
                     const eng = (part?.engravings || []).find(en => en.id === dragEngId);
                     if (eng) {
                         const a = part.angle2 * Math.PI / 180;
-                        // effectiveFlip/effectiveYFlipに応じてドラッグ方向を反転
-                        let _efx = part.flipped2D, _efy = false;
-                        if (part.shapeType === 'merged-part') {
-                            _efx = !!part.mergedFlipX;
-                            _efy = !!part.mergedFlipY;
-                        }
-                        const lsx = (_efx ? -1 : 1) * (dx * Math.cos(a) + dy * Math.sin(a));
-                        const lsy = (_efy ? -1 : 1) * (-dx * Math.sin(a) + dy * Math.cos(a));
+                        const _sfEngDrag = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
+                        const lsx = (_sfEngDrag ? -1 : 1) * (dx * Math.cos(a) + dy * Math.sin(a));
+                        const lsy = -dx * Math.sin(a) + dy * Math.cos(a);
                         eng.x = dragEngStart.x + lsx;
                         eng.y = dragEngStart.y - lsy;
                         render2D();
@@ -6779,23 +6775,27 @@ function confirmJoint() {
                     let mpEffFlip  = !!p.mergedFlipX;
                     let mpEffYFlip = !!p.mergedFlipY;
                     const localD = getOutlinePathD(p);
-                    const mpTf = `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})`;
-                    // アウトラインは mergedD をそのまま使用（ミラーなし）。穴は下の mpEffFlip/mpEffYFlip で個別に反転
+                    const mpTf = mpEffFlip
+                        ? `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy}) translate(${p.w},0) scale(-1,1)`
+                        : `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})`;
                     defs += `  <clipPath id="clip-${p.id}"><path d="${localD}" transform="${mpTf}" /></clipPath>\n`;
                     paths += `    <path d="${localD}" transform="${mpTf}" />\n`;
                     // 面接合穴を出力（buildBoardOutline から holesData を取得）
                     const { holesData: mpHolesRaw } = buildBoardOutline(p.w, p.h, jointsMap(p));
-                    // mpEffYFlipの場合Y反転が相殺、そうでなければY上向き→SVG y下向き変換
-                    const mpHoles = mpHolesRaw.map(h => ({ x: h.x, y: mpEffYFlip ? h.y : (p.h - h.y - h.h), w: h.w, h: h.h }));
+                    // mpEffFlip/mpEffYFlipに応じてX/Y反転（穴は mpTf 経由でなく座標直接展開のため）
+                    const mpHoles = mpHolesRaw.map(h => ({
+                        x: mpEffFlip ? p.w - h.x - h.w : h.x,
+                        y: mpEffYFlip ? h.y : (p.h - h.y - h.h),
+                        w: h.w, h: h.h
+                    }));
                     mpHoles.forEach(hole => {
                         const hx = Math.max(0, hole.x); const hy = Math.max(0, hole.y);
                         const hx2 = Math.min(p.w, hole.x + hole.w); const hy2 = Math.min(p.h, hole.y + hole.h);
                         if (hx2 <= hx || hy2 <= hy) return;
                         const hPts = [{ x: hx, y: hy }, { x: hx2, y: hy }, { x: hx2, y: hy2 }, { x: hx, y: hy2 }];
                         const hd = 'M' + hPts.map(pt => {
-                            const px = mpEffFlip ? p.w - pt.x : pt.x;
-                            const rx2 = (px - cx) * Math.cos(rad) - (pt.y - cy) * Math.sin(rad) + cx;
-                            const ry2 = (px - cx) * Math.sin(rad) + (pt.y - cy) * Math.cos(rad) + cy;
+                            const rx2 = (pt.x - cx) * Math.cos(rad) - (pt.y - cy) * Math.sin(rad) + cx;
+                            const ry2 = (pt.x - cx) * Math.sin(rad) + (pt.y - cy) * Math.cos(rad) + cy;
                             return `${(p.x2 + rx2).toFixed(2)},${(p.y2 + ry2).toFixed(2)}`;
                         }).join(' L') + ' Z';
                         paths += `    <path d="${hd}" />\n`;
@@ -6803,10 +6803,15 @@ function confirmJoint() {
                     return;
                 }
                 const { outerPts: rawOuter, holesData: rawHoles } = buildBoardOutline(p.w, p.h, jointsMap(p));
-                const _ro = p.flipped2D ? rawOuter.map(pt => ({ x: p.w - pt.x, y: pt.y })) : rawOuter;
-                const outerPts = _ro.map(pt => ({ x: pt.x, y: p.h - pt.y }));
-                const _rh = p.flipped2D ? rawHoles.map(h => h.type === 'arcSeg' ? { ...h, cx: p.w - h.cx, aStart: Math.PI - h.aEnd, aEnd: Math.PI - h.aStart } : { x: p.w - h.x - h.w, y: h.y, w: h.w, h: h.h }) : rawHoles;
-                const holesData = _rh.map(h => h.type === 'arcSeg' ? h : ({ x: h.x, y: p.h - h.y - h.h, w: h.w, h: h.h }));
+                const _svgShouldFlip = p.shapeType === 'merged-part' ? !!p.mergedFlipX : !!p.flipped2D;
+                const outerPts = _svgShouldFlip
+                    ? rawOuter.map(pt => ({ x: p.w - pt.x, y: p.h - pt.y }))
+                    : rawOuter.map(pt => ({ x: pt.x, y: p.h - pt.y }));
+                const holesData = (_svgShouldFlip ? rawHoles.map(h => {
+                    if (h.type === 'arcSeg') return { ...h, cx: p.w - h.cx, cy: p.h - h.cy, aStart: Math.PI - h.aEnd, aEnd: Math.PI - h.aStart };
+                    if (h.isRotated) return { ...h, cx: p.w - h.cx, cy: p.h - h.cy, angle: 180 - (h.angle || 0) };
+                    return { x: p.w - h.x - h.w, y: p.h - h.y - h.h, w: h.w, h: h.h };
+                }) : rawHoles).map(h => h.type === 'arcSeg' ? h : ({ x: h.x, y: p.h - h.y - h.h, w: h.w, h: h.h }));
                 if (isRect) {
                     const d = 'M' + outerPts.map(pt => {
                         const rx = (pt.x - cx) * Math.cos(rad) - (pt.y - cy) * Math.sin(rad) + cx; const ry = (pt.x - cx) * Math.sin(rad) + (pt.y - cy) * Math.cos(rad) + cy;
@@ -6816,8 +6821,11 @@ function confirmJoint() {
                     paths += `    <path d="${d}" />\n`;
                 } else {
                     const localD = getOutlinePathD(p);
-                    defs += `  <clipPath id="clip-${p.id}"><path d="${localD}" transform="translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})" /></clipPath>\n`;
-                    paths += `    <path d="${localD}" transform="translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})" />\n`;
+                    const _outlineTf = _svgShouldFlip
+                        ? `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy}) translate(${p.w},0) scale(-1,1)`
+                        : `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})`;
+                    defs += `  <clipPath id="clip-${p.id}"><path d="${localD}" transform="${_outlineTf}" /></clipPath>\n`;
+                    paths += `    <path d="${localD}" transform="${_outlineTf}" />\n`;
                 }
 
                 holesData.forEach(hole => {
@@ -6849,12 +6857,13 @@ function confirmJoint() {
 
                 // カーフスリット線をSVG出力（rotationを考慮した座標に変換）
                 getKerfLines(p).forEach(line => {
-                    const rotPt = (lx, ly) => {
-                        const rx2 = (lx - cx) * Math.cos(rad) - (ly - cy) * Math.sin(rad) + cx;
-                        const ry2 = (lx - cx) * Math.sin(rad) + (ly - cy) * Math.cos(rad) + cy;
+                    const rotPtK = (lx, ly) => {
+                        const flx = _svgShouldFlip ? p.w - lx : lx;
+                        const rx2 = (flx - cx) * Math.cos(rad) - (ly - cy) * Math.sin(rad) + cx;
+                        const ry2 = (flx - cx) * Math.sin(rad) + (ly - cy) * Math.cos(rad) + cy;
                         return { x: (p.x2 + rx2).toFixed(2), y: (p.y2 + ry2).toFixed(2) };
                     };
-                    const s = rotPt(line.x1, line.y1), e = rotPt(line.x2, line.y2);
+                    const s = rotPtK(line.x1, line.y1), e = rotPtK(line.x2, line.y2);
                     paths += `    <line x1="${s.x}" y1="${s.y}" x2="${e.x}" y2="${e.y}" />\n`;
                 });
             });
@@ -6867,12 +6876,14 @@ function confirmJoint() {
                 const rad = p.angle2 * Math.PI / 180, cx = p.w / 2, cy = p.h / 2;
                 let boardCutPaths = '';
                 let boardEngPaths = '';
-                // パーツローカル座標 → ワールド座標に変換するヘルパー
-                const rotPt = (lx, ly) => {
-                    const rx2 = (lx - cx) * Math.cos(rad) - (ly - cy) * Math.sin(rad) + cx;
-                    const ry2 = (lx - cx) * Math.sin(rad) + (ly - cy) * Math.cos(rad) + cy;
-                    return { x: (p.x2 + rx2).toFixed(2), y: (p.y2 + ry2).toFixed(2) };
-                };
+                // flipあり: board-local座標系のまま出力し、外側groupのtransformでflipを適用（engravingsと同じ方式）
+                const _svgShouldFlip2 = p.shapeType === 'merged-part' ? !!p.mergedFlipX : !!p.flipped2D;
+                // board-local座標をそのまま返す（回転・オフセットは_shapeGroupTfグループが担う）
+                const rotPt = (lx, ly) => ({ x: parseFloat(lx).toFixed(2), y: parseFloat(ly).toFixed(2) });
+                // _engGroupTfと同じ方式: flipあり時はtranslate+scale(-1,1)でX反転
+                const _shapeGroupTf = _svgShouldFlip2
+                    ? `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy}) translate(${p.w},0) scale(-1,1)`
+                    : `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})`;
                 // ポリゴン配列をパスd文字列に変換
                 const polyToD = pts => 'M' + pts.map(pt => `${parseFloat(pt.x).toFixed(2)},${parseFloat(pt.y).toFixed(2)}`).join(' L') + ' Z';
 
@@ -6880,70 +6891,75 @@ function confirmJoint() {
                     let shapeD;
                     if (s.type === 'merged') {
                         // 結合図形: clip-path に頼る（幾何クリップは複雑なので従来通り）
-                        shapeD = `<path d="${s.d}" fill-rule="evenodd" transform="translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})" />`;
-                        if (s.mode === 'cut') boardCutPaths += '      ' + shapeD + '\n';
+                        // _shapeGroupTf グループ内に配置するのでtransformは不要（グループが担う）
+                        shapeD = `<path d="${s.d}" fill-rule="evenodd" />`;
+                        if (s.mode === 'cut') boardCutPaths += '      ' + shapeD.replace(' />', ' fill="white" />') + '\n';
                         else boardEngPaths += '      ' + shapeD + '\n';
                         return;
                     }
+
+                    // flipあり時はX座標を反転（_mirGに渡すexと同じ: p.w - s.x）
+                    // _shapeGroupTfのscale(-1,1)が再反転して正しい位置に戻る
+                    const _ssx = _svgShouldFlip2 ? p.w - s.x : s.x;
 
                     // ─ 切断モード：ボード境界からはみ出す場合は幾何クリップする ─
                     if (s.mode === 'cut') {
                         const localPoly = _getShapeLocalPoly(s);
                         if (localPoly) {
-                            // はみ出し判定（パーツローカル座標で）
-                            const isOut = localPoly.some(pt => pt.x < 0 || pt.x > p.w || pt.y < 0 || pt.y > p.h);
+                            // はみ出し判定（パーツローカル座標で、flip後の座標で判定）
+                            const flippedPoly = _svgShouldFlip2 ? localPoly.map(pt => ({ x: p.w - pt.x, y: pt.y })) : localPoly;
+                            const isOut = flippedPoly.some(pt => pt.x < 0 || pt.x > p.w || pt.y < 0 || pt.y > p.h);
                             if (isOut) {
                                 // Sutherland-Hodgman でボード矩形にクリップ
-                                const clipped = _clipPolyToRect(localPoly, 0, 0, p.w, p.h);
+                                const clipped = _clipPolyToRect(flippedPoly, 0, 0, p.w, p.h);
                                 if (clipped.length < 3) return; // クリップ後に残らなければスキップ
-                                // ワールド座標に変換
-                                const worldPts = clipped.map(pt => rotPt(pt.x, pt.y));
-                                boardCutPaths += '      <path d="' + polyToD(worldPts) + '" />\n';
+                                // board-local座標で出力（_shapeGroupTfが変換を担う）
+                                const localPts = clipped.map(pt => rotPt(pt.x, pt.y));
+                                boardCutPaths += '      <path d="' + polyToD(localPts) + '" fill="white" />\n';
                                 return;
                             }
                         }
-                        // はみ出しなし or ポリゴン取得不可 → 従来の SVG 要素で出力
+                        // はみ出しなし or ポリゴン取得不可 → SVG 要素で出力（board-local座標）
                         if (s.type === 'circle') {
-                            const cpt = rotPt(s.x, s.y);
-                            shapeD = `<circle cx="${cpt.x}" cy="${cpt.y}" r="${s.r}" />`;
+                            const cpt = rotPt(_ssx, s.y);
+                            shapeD = `<circle cx="${cpt.x}" cy="${cpt.y}" r="${s.r}" fill="white" />`;
                         } else if (s.type === 'ellipse') {
-                            const cpt = rotPt(s.x, s.y);
-                            shapeD = `<ellipse cx="${cpt.x}" cy="${cpt.y}" rx="${((s.w||20)/2).toFixed(2)}" ry="${((s.h||20)/2).toFixed(2)}" transform="rotate(${p.angle2.toFixed(1)},${cpt.x},${cpt.y})" />`;
+                            const cpt = rotPt(_ssx, s.y);
+                            shapeD = `<ellipse cx="${cpt.x}" cy="${cpt.y}" rx="${((s.w||20)/2).toFixed(2)}" ry="${((s.h||20)/2).toFixed(2)}" fill="white" />`;
                         } else if (s.type === 'rect' || s.type === 'square') {
                             const half_w = (s.w || 20) / 2, half_h = (s.type === 'square' ? half_w : (s.h || 20) / 2);
-                            const corners = [{x:s.x-half_w,y:s.y-half_h},{x:s.x+half_w,y:s.y-half_h},{x:s.x+half_w,y:s.y+half_h},{x:s.x-half_w,y:s.y+half_h}];
-                            shapeD = `<path d="${polyToD(corners.map(pt=>rotPt(pt.x,pt.y)))}" />`;
+                            const corners = [{x:_ssx-half_w,y:s.y-half_h},{x:_ssx+half_w,y:s.y-half_h},{x:_ssx+half_w,y:s.y+half_h},{x:_ssx-half_w,y:s.y+half_h}];
+                            shapeD = `<path d="${polyToD(corners.map(pt=>rotPt(pt.x,pt.y)))}" fill="white" />`;
                         } else {
                             const lpts = getShapePolygonPts(s);
-                            if (lpts) shapeD = `<path d="${polyToD(lpts.map(lp=>rotPt(s.x+lp.x,s.y+lp.y)))}" />`;
+                            if (lpts) shapeD = `<path d="${polyToD(lpts.map(lp=>rotPt(_ssx+lp.x,s.y+lp.y)))}" fill="white" />`;
                         }
                         if (shapeD) boardCutPaths += '      ' + shapeD + '\n';
                         return;
                     }
 
-                    // ─ 刻印モード：従来通り（はみ出しはレーザー刻印なので影響が少ない） ─
+                    // ─ 刻印モード（board-local座標で出力） ─
                     if (s.type === 'circle') {
-                        const cpt = rotPt(s.x, s.y);
+                        const cpt = rotPt(_ssx, s.y);
                         shapeD = `<circle cx="${cpt.x}" cy="${cpt.y}" r="${s.r}" />`;
                     } else if (s.type === 'ellipse') {
-                        const cpt = rotPt(s.x, s.y);
-                        shapeD = `<ellipse cx="${cpt.x}" cy="${cpt.y}" rx="${((s.w||20)/2).toFixed(2)}" ry="${((s.h||20)/2).toFixed(2)}" transform="rotate(${p.angle2.toFixed(1)},${cpt.x},${cpt.y})" />`;
+                        const cpt = rotPt(_ssx, s.y);
+                        shapeD = `<ellipse cx="${cpt.x}" cy="${cpt.y}" rx="${((s.w||20)/2).toFixed(2)}" ry="${((s.h||20)/2).toFixed(2)}" />`;
                     } else if (s.type === 'rect' || s.type === 'square') {
                         const half_w = (s.w || 20) / 2, half_h = (s.type === 'square' ? half_w : (s.h || 20) / 2);
-                        const corners = [{x:s.x-half_w,y:s.y-half_h},{x:s.x+half_w,y:s.y-half_h},{x:s.x+half_w,y:s.y+half_h},{x:s.x-half_w,y:s.y+half_h}];
+                        const corners = [{x:_ssx-half_w,y:s.y-half_h},{x:_ssx+half_w,y:s.y-half_h},{x:_ssx+half_w,y:s.y+half_h},{x:_ssx-half_w,y:s.y+half_h}];
                         shapeD = `<path d="${polyToD(corners.map(pt=>rotPt(pt.x,pt.y)))}" />`;
                     } else {
                         const lpts = getShapePolygonPts(s);
-                        if (lpts) shapeD = `<path d="${polyToD(lpts.map(lp=>rotPt(s.x+lp.x,s.y+lp.y)))}" />`;
+                        if (lpts) shapeD = `<path d="${polyToD(lpts.map(lp=>rotPt(_ssx+lp.x,s.y+lp.y)))}" />`;
                     }
                     if (!shapeD) return;
                     const _isFilled = s.type === 'square' || s.type === 'star';
                     boardEngPaths += '      ' + (_isFilled ? shapeD.replace(' />', ' fill="#0000ff" />') : shapeD) + '\n';
                 });
-                // 結合図形は clip-path に頼るので従来通りグループで囲む
-                // 通常図形の cut 経路はすでに幾何クリップ済み → clip-path 不要だが、merged がある場合は必要
-                if (boardCutPaths) shapeCutPaths += `    <g clip-path="url(#clip-${p.id})">\n${boardCutPaths}    </g>\n`;
-                if (boardEngPaths) shapeEngPaths += `    <g clip-path="url(#clip-${p.id})">\n${boardEngPaths}    </g>\n`;
+                // _shapeGroupTfグループで囲む（clip-pathも適用）
+                if (boardCutPaths) shapeCutPaths += `    <g transform="${_shapeGroupTf}">\n${boardCutPaths}    </g>\n`;
+                if (boardEngPaths) shapeEngPaths += `    <g transform="${_shapeGroupTf}">\n${boardEngPaths}    </g>\n`;
             });
             paths += shapeCutPaths;
 
@@ -6951,61 +6967,38 @@ function confirmJoint() {
             outputParts.forEach(p => {
                 const rad = p.angle2 * Math.PI / 180, cx = p.w / 2, cy = p.h / 2;
                 const tx = p.x2, ty = p.y2;
-                const transformPt = (lx, ly) => {
-                    const rx = (lx - cx) * Math.cos(rad) - (ly - cy) * Math.sin(rad) + cx + tx;
-                    const ry = (lx - cx) * Math.sin(rad) + (ly - cy) * Math.cos(rad) + cy + ty;
-                    return [rx, ry];
-                };
+                const _svgShouldFlipEng = p.shapeType === 'merged-part' ? !!p.mergedFlipX : !!p.flipped2D;
+                // flipあり: board-local座標系のまま出力し、外側groupのtransformでflipを適用（2D表示の_mirGと同じ方式）
+                const _engGroupTf = _svgShouldFlipEng
+                    ? `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy}) translate(${p.w},0) scale(-1,1)`
+                    : `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})`;
                 let boardEngPaths = '';
                 (p.engravings || []).forEach(eng => {
-                    const ex = eng.x;
+                    // board-local座標をそのまま使用（_engGroupTfのflipで正しい位置・向きに）
+                    // _svgShouldFlipEng時: ex=p.w-eng.xで_mirGと同じくboard内の正しい位置に、sxに*-1で文字向き正常
+                    const ex = _svgShouldFlipEng ? p.w - eng.x : eng.x;
                     const ey = p.h - eng.y;
-                    const engRot = p.angle2 + (eng.rotation || 0);
-                    const sx = (eng.flipped ? -1 : 1);
+                    const engRot = (eng.rotation || 0) * (_svgShouldFlipEng ? -1 : 1);
+                    const sx = (eng.flipped ? -1 : 1) * (_svgShouldFlipEng ? -1 : 1);
                     if (eng.type === 'text') {
-                        const [wx, wy] = transformPt(ex, ey);
+                        // board-local座標で出力、_engGroupTfで板全体のtransform（回転・flip・配置）を適用
                         if (_hasEmoji(eng.text)) {
-                            // 絵文字を含むテキスト → canvas でレンダリングして PNG 画像として埋め込む
-                            // （レーザーソフトは絵文字フォントを持たないため <text> では描画できない）
                             const { dataUrl, mmW, mmH } = _renderTextToImage(eng.text, eng.font, eng.weight, eng.size);
                             const hW = (mmW / 2).toFixed(3), hH = (mmH / 2).toFixed(3);
-                            boardEngPaths += `      <image x="-${hW}" y="-${hH}" width="${mmW.toFixed(3)}" height="${mmH.toFixed(3)}" href="${dataUrl}" preserveAspectRatio="xMidYMid meet" stroke="none" transform="translate(${wx.toFixed(2)},${wy.toFixed(2)}) rotate(${engRot}) scale(${sx},1)" />\n`;
+                            boardEngPaths += `      <image x="-${hW}" y="-${hH}" width="${mmW.toFixed(3)}" height="${mmH.toFixed(3)}" href="${dataUrl}" preserveAspectRatio="xMidYMid meet" stroke="none" transform="translate(${ex.toFixed(2)},${ey.toFixed(2)}) rotate(${engRot}) scale(${sx},1)" />\n`;
                         } else {
-                            boardEngPaths += `      <text x="0" y="0" font-family="${eng.font}" font-size="${eng.size}" font-weight="${eng.weight || 'normal'}" text-anchor="middle" dominant-baseline="middle" transform="translate(${wx.toFixed(2)},${wy.toFixed(2)}) rotate(${engRot}) scale(${sx},1)">${eng.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</text>\n`;
+                            boardEngPaths += `      <text x="0" y="0" font-family="${eng.font}" font-size="${eng.size}" font-weight="${eng.weight || 'normal'}" text-anchor="middle" dominant-baseline="middle" transform="translate(${ex.toFixed(2)},${ey.toFixed(2)}) rotate(${engRot}) scale(${sx},1)">${eng.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</text>\n`;
                         }
                     } else if (eng.type === 'draw') {
-                        // キャンバスピクセル → パーツローカルmm座標に変換してボード境界でクリップ
-                        // その後ワールド座標に変換して出力（レーザーソフトがclip-pathを無視するため幾何クリップ）
-                        const engLocalRad = (eng.rotation || 0) * Math.PI / 180;
-                        const cosL = Math.cos(engLocalRad), sinL = Math.sin(engLocalRad);
-                        const scale = eng.scale || 1;
-                        const strokes = _parsePathToStrokes(eng.d || '');
-                        let clippedD = '';
-                        strokes.forEach(stroke => {
-                            // canvas pixels → part local mm
-                            const localPts = stroke.map(pt => {
-                                const smx = pt.x * sx * scale, smy = pt.y * scale;
-                                return {
-                                    x: smx * cosL - smy * sinL + ex,
-                                    y: smx * sinL + smy * cosL + ey
-                                };
-                            });
-                            // ボード矩形 (0,0)-(p.w, p.h) でクリップ
-                            const sublines = _clipPolylineToRect(localPts, 0, 0, p.w, p.h);
-                            // part local mm → world mm
-                            sublines.forEach(sub => {
-                                clippedD += sub.map((lpt, i) => {
-                                    const [wx, wy] = transformPt(lpt.x, lpt.y);
-                                    return (i === 0 ? 'M' : 'L') + `${wx.toFixed(3)},${wy.toFixed(3)}`;
-                                }).join(' ');
-                            });
-                        });
-                        if (clippedD) {
-                            boardEngPaths += `      <path d="${clippedD}" fill="none" stroke="#0000ff" stroke-linecap="round" stroke-linejoin="round" stroke-width="0.3" />\n`;
+                        // テキストと同じ方式: translate(ex,ey) rotate(engRot) scale(sx,1) で包み、
+                        // 外側グループのscale(-1,1)をsxの-1で打ち消す（2D表示の_esfxと同じ）
+                        const drawScale = (eng.scale || 1).toFixed(6);
+                        if (eng.d) {
+                            boardEngPaths += `      <g transform="translate(${ex.toFixed(2)},${ey.toFixed(2)}) rotate(${engRot}) scale(${sx},1)"><path d="${eng.d}" transform="scale(${drawScale})" fill="none" stroke="#0000ff" stroke-linecap="round" stroke-linejoin="round" stroke-width="${(0.5 / (eng.scale || 1)).toFixed(4)}" /></g>\n`;
                         }
                     }
                 });
-                if (boardEngPaths) engPaths += boardEngPaths;
+                if (boardEngPaths) engPaths += `    <g transform="${_engGroupTf}">\n${boardEngPaths}    </g>\n`;
             });
 
             engPaths += shapeEngPaths;
@@ -7301,6 +7294,19 @@ function confirmJoint() {
                 shape.r  = parseFloat(document.getElementById('shape-star-r').value)  || 20;
                 shape.ir = parseFloat(document.getElementById('shape-star-ir').value) || 8;
             }
+            {
+                const _flip3D_shp = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
+                if (_flip3D_shp) {
+                    shape.applyMirror = false;
+                } else if (part.mesh && camera) {
+                    part.mesh.updateMatrixWorld(true);
+                    const _planeX_shp = new THREE.Vector3(1, 0, 0).applyQuaternion(part.mesh.quaternion);
+                    const _camR_shp = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+                    shape.applyMirror = _planeX_shp.dot(_camR_shp) < 0;
+                } else {
+                    shape.applyMirror = false;
+                }
+            }
             part.shapes.push(shape);
             rebuildGeometry(part);
             render2D();
@@ -7361,12 +7367,20 @@ function confirmJoint() {
             const ox = Math.max(r, (part.w - totalW) / 2);
             const oy = Math.max(r, (part.h - totalH) / 2);
             const mode = document.getElementById('pegboard-mode').value;
+            const _flip3D_peg = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
+            let _pegApplyMirror = false;
+            if (!_flip3D_peg && part.mesh && camera) {
+                part.mesh.updateMatrixWorld(true);
+                const _planeX_peg = new THREE.Vector3(1, 0, 0).applyQuaternion(part.mesh.quaternion);
+                const _camR_peg = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+                _pegApplyMirror = _planeX_peg.dot(_camR_peg) < 0;
+            }
             part.shapes = part.shapes.filter(s => !s._pegboard);
             for (let row = 0; row < rows; row++) {
                 for (let col = 0; col < cols; col++) {
                     const cx = ox + col * pitch;
                     const cy = oy + row * pitch;
-                    part.shapes.push({ id: 'shp_' + Date.now() + '_' + row + '_' + col, type: 'circle', mode, x: cx, y: cy, r, _pegboard: true });
+                    part.shapes.push({ id: 'shp_' + Date.now() + '_' + row + '_' + col, type: 'circle', mode, x: cx, y: cy, r, _pegboard: true, applyMirror: _pegApplyMirror });
                 }
             }
             rebuildGeometry(part);
@@ -7491,25 +7505,9 @@ function confirmJoint() {
             const _flip3D = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
             const engSide = _flip3D ? -1 : 1;
 
-            // カメラ視点からテクスチャがX反転して見えるか判定する
-            // planeXWorld: メッシュのローカルX軸をワールド空間に変換したもの（engSide考慮）
-            // cameraRight: カメラのローカルX軸（右方向）
-            // 両者の内積が負の場合、テクスチャはX反転して見える
-            let applyMirror = false;
-            if (part.mesh && camera) {
-                part.mesh.updateMatrixWorld();
-                const planeXWorld = new THREE.Vector3(engSide, 0, 0).applyQuaternion(part.mesh.quaternion);
-                const cameraRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
-                applyMirror = planeXWorld.dot(cameraRight) < 0;
-            }
-            // 結合部材はmergedFlipXがtrueのとき2DでX反転されるため、3D側でも同様に反転を追加する
-            if (part.shapeType === 'merged-part' && !!part.mergedFlipX) applyMirror = !applyMirror;
-
-            // メッシュ回転による刻印テキストの方向ずれを補正する角度を計算
-            // ワールド上方向(0,1,0)を表示面に射影し、キャンバス上の「上」方向との差を求める
             let faceAngle = 0;
             if (part.mesh) {
-                part.mesh.updateMatrixWorld();
+                part.mesh.updateMatrixWorld(true);
                 const q = part.mesh.quaternion;
                 const qInv = q.clone().invert();
                 const faceNW = new THREE.Vector3(0, 0, engSide).applyQuaternion(q);
@@ -7518,8 +7516,7 @@ function confirmJoint() {
                 if (pUp.lengthSq() > 0.01) {
                     pUp.normalize();
                     const v = pUp.clone().applyQuaternion(qInv);
-                    // applyMirrorが真の場合はX反転を相殺するためfaceAngleのX成分を反転
-                    faceAngle = applyMirror ? Math.atan2(-v.x, v.y) : Math.atan2(-engSide * v.x, v.y);
+                    faceAngle = Math.atan2(-engSide * v.x, v.y);
                 }
             }
 
@@ -7530,15 +7527,20 @@ function confirmJoint() {
             off.width = cw; off.height = ch;
             const ctx = off.getContext('2d');
 
-            // カメラからX反転して見える場合、キャンバスを水平ミラーして事前に打ち消す
-            if (applyMirror) {
-                ctx.save();
-                ctx.translate(cw, 0);
-                ctx.scale(-1, 1);
-            }
-
             engs.forEach(eng => {
+                // 旧データ互換: applyMirrorが未保存の場合はカメラから算出して保存
+                if (eng.applyMirror === undefined) {
+                    if (_flip3D) {
+                        eng.applyMirror = false;
+                    } else if (part.mesh && camera) {
+                        part.mesh.updateMatrixWorld(true);
+                        const _planeX = new THREE.Vector3(1, 0, 0).applyQuaternion(part.mesh.quaternion);
+                        const _camR = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+                        eng.applyMirror = _planeX.dot(_camR) < 0;
+                    } else { eng.applyMirror = false; }
+                }
                 ctx.save();
+                if (eng.applyMirror) { ctx.translate(cw, 0); ctx.scale(-1, 1); }
                 ctx.translate(eng.x * res, (part.h - eng.y) * res);
                 ctx.rotate((eng.rotation || 0) * Math.PI / 180 + faceAngle);
                 ctx.scale((eng.flipped ? -1 : 1), 1);
@@ -7556,10 +7558,6 @@ function confirmJoint() {
                 }
                 ctx.restore();
             });
-
-            if (applyMirror) {
-                ctx.restore();
-            }
 
             const texture = new THREE.CanvasTexture(off);
             const plane = new THREE.Mesh(
@@ -7626,6 +7624,19 @@ function confirmJoint() {
                 part.flipped2D = false;
             }
 
+            {
+                const _flip3D_eng = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
+                if (_flip3D_eng) {
+                    newEng.applyMirror = false;
+                } else if (part.mesh && camera) {
+                    part.mesh.updateMatrixWorld(true);
+                    const _planeX_eng = new THREE.Vector3(1, 0, 0).applyQuaternion(part.mesh.quaternion);
+                    const _camR_eng = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+                    newEng.applyMirror = _planeX_eng.dot(_camR_eng) < 0;
+                } else {
+                    newEng.applyMirror = false;
+                }
+            }
             part.engravings.push(newEng);
             if (_engMode === 'text') document.getElementById('eng-text').value = '';
 
@@ -7766,12 +7777,40 @@ function confirmJoint() {
             pushState();
             const newMm = Math.max(5, Math.min(500, parseFloat(mm) || 30));
             eng.scale = newMm / 580;
-            rebuildGeometry(part);
+            update3DEngravings(part);
+            render2D();
+            updateEngList();
+        }
+
+        function copyEng(partId, engId) {
+            const part = partsData.find(p => p.id === partId);
+            if (!part) return;
+            const eng = part.engravings.find(e => e.id === engId);
+            if (!eng) return;
+            _engClipboard = JSON.parse(JSON.stringify(eng));
+            const btn = document.getElementById('paste-eng-btn');
+            if (btn) btn.style.display = 'inline-block';
+        }
+
+        function pasteEng() {
+            if (!_engClipboard || !selectedId) return;
+            const part = partsData.find(p => p.id === selectedId);
+            if (!part) return;
+            const newEng = JSON.parse(JSON.stringify(_engClipboard));
+            newEng.id = 'eng_' + Date.now();
+            newEng.x = part.w / 2;
+            newEng.y = part.h / 2;
+            if (!part.engravings) part.engravings = [];
+            pushState();
+            part.engravings.push(newEng);
+            update3DEngravings(part);
             render2D();
             updateEngList();
         }
 
         function updateEngList() {
+            const pasteBtn = document.getElementById('paste-eng-btn');
+            if (pasteBtn) pasteBtn.style.display = _engClipboard ? 'inline-block' : 'none';
             const container = document.getElementById('eng-list-container');
             if (!container) return;
             const part = partsData.find(p => p.id === selectedId);
@@ -7799,6 +7838,7 @@ function confirmJoint() {
     <button style="flex:1;min-width:36px;font-size:10px;padding:2px 4px;background:#555;color:#fff;border:none;border-radius:3px;cursor:pointer;margin-top:0;" onclick="rotateEng('${part.id}','${e.id}',-45)" title="左45°回転">↺45°</button>
     <button style="flex:1;min-width:36px;font-size:10px;padding:2px 4px;background:#555;color:#fff;border:none;border-radius:3px;cursor:pointer;margin-top:0;" onclick="rotateEng('${part.id}','${e.id}',45)" title="右45°回転">↻45°</button>
     <button style="flex:1;min-width:36px;font-size:10px;padding:2px 4px;background:#0b57d0;color:#fff;border:none;border-radius:3px;cursor:pointer;margin-top:0;" onclick="flipEng('${part.id}','${e.id}')" title="左右反転">↔反転</button>
+    <button style="flex:1;min-width:36px;font-size:10px;padding:2px 4px;background:#2a7;color:#fff;border:none;border-radius:3px;cursor:pointer;margin-top:0;" onclick="copyEng('${part.id}','${e.id}')" title="コピー">📋コピー</button>
     <button style="flex:1;min-width:36px;font-size:10px;padding:2px 4px;background:#c44;color:#fff;border:none;border-radius:3px;cursor:pointer;margin-top:0;" onclick="deleteEngraving('${part.id}','${e.id}')">✕削除</button>
   </div>` : '';
                 return `<div class="eng-item${isSel ? ' eng-item-selected' : ''}" style="flex-direction:column;align-items:stretch;cursor:pointer;" onclick="selectedEng3DId='${e.id}';updateEngList();">
