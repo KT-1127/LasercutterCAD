@@ -1,3 +1,8 @@
+<!--
+    LaserCutter CAD（きとり）
+    © Iizuna_KT
+    授業での利用・改変は自由。再配布時は著作者名（Iizuna_KT）を残すこと。
+-->
 <!DOCTYPE html>
 <html lang="ja">
 
@@ -10,14 +15,6 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
     <script src="https://unpkg.com/polygon-clipping@0.15.7/dist/polygon-clipping.umd.js"></script>
-
-    <!-- Firebase SDK (compat) -->
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-storage-compat.js"></script>
-    <script src="firebase-config.js"></script>
 
     <style>
         :root {
@@ -731,14 +728,13 @@
         </div>
 
         <div class="file-actions">
-            <button onclick="backToDashboard()" style="background:#0b57d0;color:white;font-weight:700;">← マイ作品へ</button>
             <input type="text" id="project-name-input"
                    value="マイプロジェクト"
                    placeholder="作品名を入力"
                    oninput="onProjectNameChange()"
-                   style="flex:1;min-width:100px;padding:5px 10px;border:1px solid #c5d5f5;border-radius:6px;font-size:13px;font-weight:700;color:#1a1614;background:#fff;outline:none;"
+                   style="flex:1 1 100%;padding:5px 10px;border:1px solid #c5d5f5;border-radius:6px;font-size:13px;font-weight:700;color:#1a1614;background:#fff;outline:none;"
                    title="作品名をここで変更できます">
-            <button onclick="submitProject()" style="background:#34a853;font-weight:700;">学年ライブラリへ提出</button>
+            <button onclick="newProject()">🆕 新規作成</button>
             <button onclick="saveProject()">💾 保存</button>
             <button onclick="document.getElementById('file-open-input').click()">📂 開く</button>
             <input type="file" id="file-open-input" accept=".json" style="display:none" onchange="loadProject(event)">
@@ -998,168 +994,14 @@
     </div>
 
     <script>
-        // ========== Firebase セッション管理 ==========
-        const _urlParams     = new URLSearchParams(window.location.search);
-        const _readonly      = _urlParams.get('readonly') === '1';   // ギャラリー閲覧モード
-        const _teacherMode   = _urlParams.get('teacher')  === '1';   // 教師編集モード
-        const _fbSession     = JSON.parse(localStorage.getItem('lcs_session') || 'null');
-        const _projectId     = _urlParams.get('id');
-        let   _teacherUser   = null;   // 教師モード時に Firebase Auth ユーザーを格納
-
-        // readonlyでも教師モードでもないのにセッションがない → ログインへ
-        if (!_fbSession && !_readonly && !_teacherMode) { window.location.replace('index.html'); }
-        // プロジェクトIDがない → ダッシュボードへ
-        if (!_projectId) { window.location.replace('dashboard.html'); }
-
-        const _db = firebase.firestore();
-        // RTDB はオプション（未作成でも動くよう try-catch）
-        let _rtdb = null;
-        try { _rtdb = firebase.database(); } catch(e) { console.warn('RTDB not available:', e); }
-
-        // ===== レーザー受付システム用 Firebase (lasercutter-web) =====
-        const _laserWebConfig = {
-            apiKey: "AIzaSyBorTPs393fGPhR1nqgLAx9CeKstvmah-I",
-            authDomain: "lasercutter-web.firebaseapp.com",
-            projectId: "lasercutter-web",
-            storageBucket: "lasercutter-web.firebasestorage.app",
-            messagingSenderId: "1002171336061",
-            appId: "1:1002171336061:web:41ca43a268d6a27def7814"
-        };
-        const _laserWebApp = firebase.apps.find(a => a.name === 'laserWeb') || firebase.initializeApp(_laserWebConfig, 'laserWeb');
-        const _laserWebDb      = _laserWebApp.firestore();
-        const _laserWebStorage = _laserWebApp.storage();
-
-        // Firebase パス用に生徒名をサニタイズ（日本語はそのまま、制御文字のみ除去）
-        function _sanitizeName(name) {
-            return (name || 'unknown')
-                .replace(/[.$#[\]/\x00-\x1f]/g, '_')
-                .replace(/\s+/g, '_')
-                .slice(0, 64) || 'unknown';
-        }
-        const _rtdbKey = _fbSession ? _sanitizeName(_fbSession.studentName) : 'unknown';
-
-        // 教師モード：Firebase Auth でログイン状態を確認（メール＝教師）
-        // 生徒モード：匿名サインイン
-        if (_teacherMode) {
-            firebase.auth().onAuthStateChanged(user => {
-                if (!user || !user.email) {
-                    // 教師ログインがなければログインページへ
-                    window.location.replace('index.html');
-                } else {
-                    _teacherUser = user;
-                }
-            });
-        } else {
-            firebase.auth().signInAnonymously().catch(e => console.warn('anon auth:', e));
-        }
-
-        let _fbSaveTimer = null;
-        let _fbSaving = false;
-
-        function _captureThumb() {
-            try {
-                if (typeof renderer !== 'undefined' && renderer && renderer.domElement) {
-                    renderer.render(scene, camera);
-                    return renderer.domElement.toDataURL('image/jpeg', 0.35);
-                }
-            } catch(e) {}
-            return '';
-        }
-
-        async function _saveToFirebase() {
-            // 生徒セッションまたは教師モードのどちらかが必要
-            if (!_projectId || (!_fbSession && !_teacherMode) || _fbSaving) return;
-            _fbSaving = true;
-            try {
-                const snap = getSnapshot();
-                const thumb = _captureThumb();
-                await _db.collection('projects').doc(_projectId).update({
-                    data: snap,
-                    thumbnail: thumb,
-                    title: currentProjectName || 'マイプロジェクト',
-                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-                });
-                showAutoSaveIndicator(_teacherMode
-                    ? '☁️ 保存済み（教師）'
-                    : (_isDefaultName() ? '保存済 ／ 作品名を変更してください' : '☁️ 保存済み'));
-            } catch(e) {
-                showAutoSaveIndicator('⚠️ 保存失敗');
-                console.error('Firebase save error:', e);
-            }
-            _fbSaving = false;
-        }
-
-        function _pushThumbnailRTDB() {
-            if (_readonly || _teacherMode) return;  // 教師モードはRTDB送信不要
-            if (!_rtdb)      { console.warn('[RTDB] firebase.database() が初期化されていません'); return; }
-            if (!_fbSession) { console.warn('[RTDB] セッションなし'); return; }
-            if (!_projectId) { console.warn('[RTDB] projectId なし'); return; }
-
-            const payload = {
-                studentName:  _fbSession.studentName,
-                thumbnail:    _captureThumb(),
-                projectTitle: currentProjectName || 'マイプロジェクト',
-                projectId:    _projectId,
-                lastSeen:     firebase.database.ServerValue.TIMESTAMP
-            };
-            const path = `active/${_fbSession.classId}/${_rtdbKey}`;
-            // console.log('[RTDB] 送信中:', path, payload.studentName, payload.projectTitle);
-
-            _rtdb.ref(path).set(payload)
-                .then(() => { /* 送信成功 */ })
-                .catch(e  => console.error('[RTDB] 送信エラー:', e.message, e.code));
-        }
-
-        function backToDashboard() {
-            try {
-                if (_rtdb && _fbSession) {
-                    _rtdb.ref(`active/${_fbSession.classId}/${_rtdbKey}`).remove();
-                }
-            } catch(e) {}
-            if (_teacherMode) {
-                window.close();
-            } else {
-                window.location.href = 'dashboard.html';
-            }
-        }
+        // ========== スタンドアロン初期化 ==========
 
         const _DEFAULT_NAMES = ['マイプロジェクト', '新しい作品', ''];
 
         function _isDefaultName() {
             return _DEFAULT_NAMES.includes((currentProjectName || '').trim());
         }
-
-        function submitProject() {
-            // デフォルト名のまま提出しようとしたら先に名前変更を促す
-            if (_isDefaultName()) {
-                showModal('作品名が「' + (currentProjectName || 'マイプロジェクト') + '」のままです。\n上の入力欄で作品名を変えてから提出してください。');
-                const inp = document.getElementById('project-name-input');
-                if (inp) { inp.focus(); inp.select(); inp.style.borderColor = '#f97316'; }
-                return;
-            }
-            showModal('「' + currentProjectName + '」を学年ライブラリに投稿しますか？', true, async (ok) => {
-                if (!ok) return;
-                try {
-                    await _saveToFirebase();
-                    await _db.collection('projects').doc(_projectId).update({
-                        status: 'submitted',
-                        submittedAt: firebase.firestore.FieldValue.serverTimestamp()
-                    });
-                    showModal('投稿しました！学年のみんなが見られます。');
-                } catch(e) {
-                    showModal('投稿に失敗しました: ' + e.message);
-                }
-            });
-        }
-
-        window.addEventListener('beforeunload', () => {
-            try {
-                if (!_teacherMode && _rtdb && _fbSession) {
-                    _rtdb.ref(`active/${_fbSession.classId}/${_rtdbKey}`).remove();
-                }
-            } catch(e) {}
-        });
-        // ========== Firebase セッション管理 ここまで ==========
+        // ========== スタンドアロン初期化 ここまで ==========
 
         let autoJointAssist = false; // ★Shift+J 押下中のみ true
         window.addEventListener('DOMContentLoaded', () => {
@@ -1322,7 +1164,6 @@
             if (document.getElementById('panel-2d').classList.contains('active')) { render2D(); }
             checkOverlaps();
             // カメラquaternionが確定した後（2フレーム後）に刻印・図形テクスチャを再生成
-            // （ページ読み込み直後はcamera.quaternionがまだ正しくなく、applyMirror判定がズレるため）
             requestAnimationFrame(() => requestAnimationFrame(() => {
                 partsData.forEach(p => {
                     if ((p.engravings || []).length > 0) update3DEngravings(p);
@@ -1381,103 +1222,8 @@
             window.addEventListener('pointercancel', _endStrayShapeDrags);
             window.addEventListener('blur', () => { if (dragShp3D || dragEng3D) _endStrayShapeDrags(); });
             pushState();
-            // Firebase からプロジェクトを読み込む
-            if (_projectId) {
-                _db.collection('projects').doc(_projectId).get().then(doc => {
-                    if (doc.exists) {
-                        const d = doc.data();
-                        if (d.data) {
-                            try {
-                                undoStack = []; redoStack = [];
-                                restoreSnapshot(d.data);
-                                updateUndoRedoUI();
-                            } catch(e) { console.error('Load error:', e); }
-                        }
-                        // readonlyモードのタイトル表示
-                        if (_readonly) {
-                            const el = document.getElementById('_ro_title');
-                            if (el) el.textContent = (d.title || '無題') + '　' + (d.studentName || '');
-                        }
-                        // 作品名を入力欄にセット
-                        if (d.title) {
-                            currentProjectName = d.title;
-                            const inp = document.getElementById('project-name-input');
-                            if (inp) {
-                                inp.value = d.title;
-                                inp.style.borderColor = _isDefaultName() ? '#f97316' : '#c5d5f5';
-                            }
-                        }
-                        // プロジェクト読み込み直後に即時送信（15秒を待たない）
-                        if (!_readonly) {
-                            setTimeout(_pushThumbnailRTDB, 1500);
-                        }
-                    }
-                });
-            }
-            // 15秒ごとに教師監視用サムネイルをRTDBへ送信（readonlyは不要）
-            if (!_readonly) setInterval(_pushThumbnailRTDB, 15000);
-
-            // ── ギャラリー閲覧モード（readonly） ──────────────────
-            if (_readonly) {
-                // サイドバー・操作ボタンを非表示にして3Dビューを全画面に
-                document.getElementById('sidebar').style.display = 'none';
-                const fa = document.querySelector('.file-actions');
-                if (fa) fa.style.display = 'none';
-                const ot = document.getElementById('overlay-text');
-                if (ot) ot.style.display = 'none';
-
-                // 閉じるボタンをオーバーレイ表示
-                const closeBtn = document.createElement('div');
-                closeBtn.style.cssText = [
-                    'position:fixed', 'top:16px', 'left:16px', 'z-index:999',
-                    'background:#1c1917', 'color:#f0ece6',
-                    'border:1px solid rgba(255,255,255,0.2)',
-                    'border-left:3px solid #f97316',
-                    'border-radius:4px', 'padding:10px 18px',
-                    'cursor:pointer', 'font-size:0.85em', 'font-weight:700',
-                    'letter-spacing:0.05em', 'font-family:system-ui,sans-serif'
-                ].join(';');
-                closeBtn.textContent = '← 閉じる';
-                closeBtn.onclick = () => window.close();
-                document.body.appendChild(closeBtn);
-
-                // 作品タイトルを右上に表示
-                const titleDiv = document.createElement('div');
-                titleDiv.style.cssText = [
-                    'position:fixed', 'top:16px', 'right:16px', 'z-index:999',
-                    'background:rgba(28,25,23,0.85)',
-                    'color:#f0ece6', 'border-radius:4px',
-                    'padding:10px 16px', 'font-size:0.82em',
-                    'font-family:system-ui,sans-serif',
-                    'border:1px solid rgba(255,255,255,0.1)'
-                ].join(';');
-                titleDiv.id = '_ro_title';
-                document.body.appendChild(titleDiv);
-            }
-
-            // ── 教師編集モード ──────────────────────────────────
-            if (_teacherMode) {
-                // 「マイ作品へ」ボタンを「← 閉じる」に変更
-                const backBtn = document.querySelector('.file-actions button');
-                if (backBtn) {
-                    backBtn.textContent = '← 閉じる';
-                    backBtn.title = 'タブを閉じて教師ページに戻る';
-                }
-                // 「学年ライブラリへ提出」ボタンを非表示
-                const submitBtn = document.querySelector('.file-actions button[onclick="submitProject()"]');
-                if (submitBtn) submitBtn.style.display = 'none';
-                // 教師バッジをオーバーレイ表示
-                const badge = document.createElement('div');
-                badge.style.cssText = [
-                    'position:fixed', 'top:0', 'right:0', 'z-index:999',
-                    'background:#f97316', 'color:white',
-                    'padding:4px 14px', 'font-size:0.72em', 'font-weight:700',
-                    'letter-spacing:0.1em', 'font-family:system-ui,sans-serif',
-                    'border-bottom-left-radius:4px'
-                ].join(';');
-                badge.textContent = 'TEACHER MODE';
-                document.body.appendChild(badge);
-            }
+            // localStorage から前回の続きを復元
+            tryLoadLastProject();
         }
 
         function init3D() {
@@ -2894,7 +2640,6 @@
             const _flip3D = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
             const engSide = _flip3D ? -1 : 1;
 
-
             const res = 4; // px/mm
             const cw = Math.max(1, Math.round(part.w * res));
             const ch = Math.max(1, Math.round(part.h * res));
@@ -2915,8 +2660,6 @@
                         s.applyMirror = _planeX.dot(_camR) < 0;
                     } else { s.applyMirror = false; }
                 }
-                const _3d_x_drawn = s.applyMirror ? (part.w - s.x) : s.x;
-                console.log('[3D shape]', { id: s.id, type: s.type, sx: s.x, partW: part.w, flipped2D: part.flipped2D, _flip3D, applyMirror: s.applyMirror, x_drawn_in_3D: _3d_x_drawn });
                 ctx.save();
                 if (s.applyMirror) { ctx.translate(cw, 0); ctx.scale(-1, 1); }
                 const isCut = s.mode === 'cut';
@@ -3564,7 +3307,6 @@ function checkOverlaps() {
                 pickEdgeAt(e.clientX, e.clientY);
             });
             container.addEventListener('pointerdown', (e) => {
-                if (_readonly) return; // 閲覧モードでは板の移動・選択を禁止
                 pointerDownPos = { x: e.clientX, y: e.clientY };
                 if (!jointMode && !selectingFor2D) {
                     const rect = container.getBoundingClientRect();
@@ -6509,7 +6251,6 @@ function confirmJoint() {
 
                     // ① 本体（見た目）- shouldFlip時: _mirGがscale(-1,1)するためp.w-s.xを渡すとs.xの位置に描画される
                     const _ssx = shouldFlip ? p.w - s.x : s.x;
-                    console.log('[2D shape]', { id: s.id, type: s.type, sx: s.x, partW: p.w, shouldFlip, applyMirror: s.applyMirror, x_drawn_in_2D: _ssx });
                     let el;
                     if (s.type === 'merged') {
                         el = document.createElementNS(SVG_NS, 'path');
@@ -7228,11 +6969,6 @@ function confirmJoint() {
                 const tx = p.x2, ty = p.y2;
                 const _svgShouldFlipEng = p.shapeType === 'merged-part' ? !!p.mergedFlipX : !!p.flipped2D;
                 // flipあり: board-local座標系のまま出力し、外側groupのtransformでflipを適用（2D表示の_mirGと同じ方式）
-                const transformPt = (lx, ly) => {
-                    const rx = (lx - cx) * Math.cos(rad) - (ly - cy) * Math.sin(rad) + cx;
-                    const ry = (lx - cx) * Math.sin(rad) + (ly - cy) * Math.cos(rad) + cy;
-                    return [rx, ry];
-                };
                 const _engGroupTf = _svgShouldFlipEng
                     ? `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy}) translate(${p.w},0) scale(-1,1)`
                     : `translate(${p.x2},${p.y2}) rotate(${p.angle2},${cx},${cy})`;
@@ -7268,40 +7004,15 @@ function confirmJoint() {
             engPaths += shapeEngPaths;
             const svgContent = `<?xml version="1.0" encoding="utf-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${board.w} ${board.h}" width="${board.w}mm" height="${board.h}mm">\n  <defs>\n${defs}  </defs>\n  <g id="cut" fill="none" stroke="#000000" stroke-width="0.1mm">\n${paths}  </g>\n  <g id="engrave" fill="none" stroke="#0000ff" stroke-width="0.1mm">\n${engPaths}  </g>\n</svg>`;
 
-
-            // Firebase Storage へアップロードしてキューに追加
-            const _laserBtn = document.querySelector('[onclick="exportLaserSVG()"]');
-            const _origBtnText = _laserBtn ? _laserBtn.textContent : '';
-            if (_laserBtn) { _laserBtn.disabled = true; _laserBtn.textContent = '送信中...'; }
-            try {
-                const _storage = _laserWebStorage;
-                const _fdb = _laserWebDb;
-                const _appId = 'default-app-id';
-                const _studentName = (_fbSession && _fbSession.studentName) ? _fbSession.studentName : '不明';
-                const _projectTitle = currentProjectName || 'マイプロジェクト';
-                const _safeStudent = _studentName.replace(/[\/\\.#$\[\]]/g, '_');
-                const _safeTitle   = _projectTitle.replace(/[\/\\.#$\[\]]/g, '_');
-                const _fileName = `${Date.now()}_${_safeStudent}_${_safeTitle}.svg`;
-                const _storagePath = `artifacts/${_appId}/public/data/files/${_fileName}`;
-                const _fileRef = _storage.ref(_storagePath);
-                const _blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
-                await _fileRef.put(_blob);
-                const _fileUrl = await _fileRef.getDownloadURL();
-                await _fdb.collection(`artifacts/${_appId}/public/data/laser_queue`).add({
-                    studentName: _studentName,
-                    projectTitle: _projectTitle,
-                    fileUrl: _fileUrl,
-                    filePath: _storagePath,
-                    status: 'waiting',
-                    createdAt: firebase.firestore.FieldValue.serverTimestamp()
-                });
-                showModal(`✅ 送信完了！\n${_studentName}「${_projectTitle}」を先生に送りました。`);
-            } catch (err) {
-                console.error('レーザーSVG送信エラー:', err);
-                showModal('❌ 送信に失敗しました。\n' + err.message);
-            } finally {
-                if (_laserBtn) { _laserBtn.disabled = false; _laserBtn.textContent = _origBtnText; }
-            }
+            // SVGをローカルにダウンロード
+            const _safeTitle = (currentProjectName || 'kidori').replace(/[\/\\.#$\[\]<>:"|?*]/g, '_');
+            const _fileName = `${_safeTitle}_laser.svg`;
+            const _blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
+            const _url = URL.createObjectURL(_blob);
+            const _a = document.createElement('a');
+            _a.href = _url; _a.download = _fileName;
+            document.body.appendChild(_a); _a.click();
+            document.body.removeChild(_a); URL.revokeObjectURL(_url);
         }
 
         // ===== 穴・形状機能 =====
@@ -7794,7 +7505,6 @@ function confirmJoint() {
             const _flip3D = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
             const engSide = _flip3D ? -1 : 1;
 
-            // メッシュ回転による刻印テキストの方向ずれを補正する角度を計算
             let faceAngle = 0;
             if (part.mesh) {
                 part.mesh.updateMatrixWorld(true);
@@ -7809,7 +7519,6 @@ function confirmJoint() {
                     faceAngle = Math.atan2(-engSide * v.x, v.y);
                 }
             }
-
 
             const res = 4;
             const cw = Math.max(1, Math.round(part.w * res));
@@ -7834,7 +7543,6 @@ function confirmJoint() {
                 if (eng.applyMirror) { ctx.translate(cw, 0); ctx.scale(-1, 1); }
                 ctx.translate(eng.x * res, (part.h - eng.y) * res);
                 ctx.rotate((eng.rotation || 0) * Math.PI / 180 + faceAngle);
-
                 ctx.scale((eng.flipped ? -1 : 1), 1);
                 if (eng.type === 'text') {
                     const fs = eng.size * res;
@@ -7919,7 +7627,6 @@ function confirmJoint() {
             {
                 const _flip3D_eng = part.shapeType === 'merged-part' ? !!part.mergedFlipX : !!part.flipped2D;
                 if (_flip3D_eng) {
-                    // 裏面プレーンはrotation.y=πで配置されUVが反転しないため、テクスチャ反転は不要
                     newEng.applyMirror = false;
                 } else if (part.mesh && camera) {
                     part.mesh.updateMatrixWorld(true);
@@ -8070,16 +7777,42 @@ function confirmJoint() {
             pushState();
             const newMm = Math.max(5, Math.min(500, parseFloat(mm) || 30));
             eng.scale = newMm / 580;
-            rebuildGeometry(part);
+            update3DEngravings(part);
+            render2D();
+            updateEngList();
+        }
+
+        function copyEng(partId, engId) {
+            const part = partsData.find(p => p.id === partId);
+            if (!part) return;
+            const eng = part.engravings.find(e => e.id === engId);
+            if (!eng) return;
+            _engClipboard = JSON.parse(JSON.stringify(eng));
+            const btn = document.getElementById('paste-eng-btn');
+            if (btn) btn.style.display = 'inline-block';
+        }
+
+        function pasteEng() {
+            if (!_engClipboard || !selectedId) return;
+            const part = partsData.find(p => p.id === selectedId);
+            if (!part) return;
+            const newEng = JSON.parse(JSON.stringify(_engClipboard));
+            newEng.id = 'eng_' + Date.now();
+            newEng.x = part.w / 2;
+            newEng.y = part.h / 2;
+            if (!part.engravings) part.engravings = [];
+            pushState();
+            part.engravings.push(newEng);
+            update3DEngravings(part);
             render2D();
             updateEngList();
         }
 
         function updateEngList() {
-            const container = document.getElementById('eng-list-container');
-            if (!container) return;
             const pasteBtn = document.getElementById('paste-eng-btn');
             if (pasteBtn) pasteBtn.style.display = _engClipboard ? 'inline-block' : 'none';
+            const container = document.getElementById('eng-list-container');
+            if (!container) return;
             const part = partsData.find(p => p.id === selectedId);
             if (!part || !part.engravings || part.engravings.length === 0) { container.innerHTML = ''; return; }
             const nums = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩'];
@@ -8114,33 +7847,6 @@ function confirmJoint() {
             }).join('');
         }
 
-        function copyEng(partId, engId) {
-            const part = partsData.find(p => p.id === partId);
-            if (!part) return;
-            const eng = part.engravings.find(e => e.id === engId);
-            if (!eng) return;
-            _engClipboard = JSON.parse(JSON.stringify(eng));
-            const btn = document.getElementById('paste-eng-btn');
-            if (btn) btn.style.display = 'inline-block';
-        }
-
-        function pasteEng() {
-            if (!_engClipboard || !selectedId) return;
-            const part = partsData.find(p => p.id === selectedId);
-            if (!part) return;
-            const newEng = JSON.parse(JSON.stringify(_engClipboard));
-            newEng.id = 'eng_' + Date.now();
-            // 貼り付け先の板サイズに合わせて中央に配置
-            newEng.x = part.w / 2;
-            newEng.y = part.h / 2;
-            if (!part.engravings) part.engravings = [];
-            part.engravings.push(newEng);
-            pushState();
-            update3DEngravings(part);
-            render2D();
-            updateEngList();
-        }
-
         function _doNewProject() {
             partsData.forEach(p => { scene.remove(p.mesh); p.mesh.geometry.dispose(); p.mesh.material.dispose(); });
             partsData = [];
@@ -8152,6 +7858,15 @@ function confirmJoint() {
             updateUndoRedoUI();
             currentProjectId = null;
             currentProjectName = 'マイプロジェクト';
+            // localStorageの自動保存データをクリア
+            try {
+                const projects = getProjectList();
+                projects.forEach(p => localStorage.removeItem('kidori_project_' + p.id));
+                localStorage.removeItem('kidori_projects');
+                localStorage.removeItem('kidori_current');
+            } catch(e) {}
+            const inp = document.getElementById('project-name-input');
+            if (inp) { inp.value = 'マイプロジェクト'; inp.style.borderColor = '#f97316'; }
             if (document.getElementById('panel-2d').classList.contains('active')) {
                 switchTab('3d');
             }
@@ -8166,12 +7881,11 @@ function confirmJoint() {
                 return;
             }
             showModal(
-                '現在の作品を保存しますか？',
+                '現在の作品は消えます。よろしいですか？\n（先に「💾 保存」でJSONファイルに保存できます）',
                 true,
-                (ok) => { if (ok) { saveProject(); _doNewProject(); } },
-                '保存せずに新規作成',
-                () => { _doNewProject(); },
-                '保存して新規作成'
+                (ok) => { if (ok) { _doNewProject(); } },
+                null, null,
+                'リセットする'
             );
         }
 
@@ -8205,8 +7919,6 @@ function confirmJoint() {
             if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
             _autoSaveTimer = setTimeout(() => {
                 autoSaveToLocalStorage();
-                if (_fbSaveTimer) clearTimeout(_fbSaveTimer);
-                _fbSaveTimer = setTimeout(_saveToFirebase, 2000);
             }, 1500);
         }
 
@@ -8252,7 +7964,30 @@ function confirmJoint() {
         }
 
         function tryLoadLastProject() {
-            // Firebase版: プロジェクト読み込みは init() 内の Firestore 処理で行う
+            try {
+                const lastId = localStorage.getItem('kidori_current');
+                if (!lastId) return;
+                const snap = localStorage.getItem('kidori_project_' + lastId);
+                if (!snap) return;
+                currentProjectId = lastId;
+                undoStack = []; redoStack = [];
+                restoreSnapshot(snap);
+                updateUndoRedoUI();
+                // 作品名を入力欄に反映
+                const projects = getProjectList();
+                const meta = projects.find(p => p.id === lastId);
+                if (meta && meta.name) {
+                    currentProjectName = meta.name;
+                    const inp = document.getElementById('project-name-input');
+                    if (inp) {
+                        inp.value = meta.name;
+                        inp.style.borderColor = _isDefaultName() ? '#f97316' : '#c5d5f5';
+                    }
+                }
+                showAutoSaveIndicator('✅ 前回の続きを復元しました');
+            } catch(e) {
+                console.warn('自動復元に失敗:', e);
+            }
         }
 
 
@@ -8362,6 +8097,10 @@ function confirmJoint() {
         <button onclick="closeShapeModal()" style="width:100%;padding:8px;background:#eee;border:none;border-radius:4px;cursor:pointer;font-size:13px;">閉じる</button>
       </div>
     </div>
+
+    <footer style="position:fixed;bottom:0;right:0;z-index:50;padding:3px 10px;font-size:10px;color:#aaa;background:rgba(255,255,255,0.7);pointer-events:none;">
+        © Iizuna_KT ／ 授業での利用・改変は自由。再配布時は著作者名を残すこと。
+    </footer>
 
 </body>
 
